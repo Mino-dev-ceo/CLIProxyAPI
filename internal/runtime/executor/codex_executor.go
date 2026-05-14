@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -36,6 +37,39 @@ const (
 )
 
 var dataTag = []byte("data:")
+
+func codexImageHTTP11Enabled() bool {
+	raw := strings.TrimSpace(strings.ToLower(os.Getenv("CPA_CODEX_IMAGE_HTTP11")))
+	if raw == "" {
+		return true
+	}
+	switch raw {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+func codexPayloadRequestsImageGeneration(body []byte) bool {
+	return strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, "tool_choice.type").String()), "image_generation")
+}
+
+func forceHTTP11Client(client *http.Client) *http.Client {
+	if client == nil {
+		client = &http.Client{}
+	}
+	if client.Transport == nil {
+		if base, ok := http.DefaultTransport.(*http.Transport); ok {
+			client.Transport = cloneTransportWithHTTP11(base)
+		}
+		return client
+	}
+	if transport, ok := client.Transport.(*http.Transport); ok {
+		client.Transport = cloneTransportWithHTTP11(transport)
+	}
+	return client
+}
 
 // Streamed Codex responses may emit response.output_item.done events while leaving
 // response.completed.response.output empty. Keep the stream path aligned with the
@@ -210,6 +244,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		AuthValue: authValue,
 	})
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	if codexImageHTTP11Enabled() && codexPayloadRequestsImageGeneration(body) {
+		httpClient = forceHTTP11Client(httpClient)
+	}
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -361,6 +398,9 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		AuthValue: authValue,
 	})
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	if codexImageHTTP11Enabled() && codexPayloadRequestsImageGeneration(body) {
+		httpClient = forceHTTP11Client(httpClient)
+	}
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -460,6 +500,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	})
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	if codexImageHTTP11Enabled() && codexPayloadRequestsImageGeneration(body) {
+		httpClient = forceHTTP11Client(httpClient)
+	}
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)

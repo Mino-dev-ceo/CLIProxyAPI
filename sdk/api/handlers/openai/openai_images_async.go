@@ -277,8 +277,8 @@ func executeImageAsyncTask(ctx context.Context, h *OpenAIAPIHandler, responsesRe
 	if mainModel == "" {
 		mainModel = defaultImagesMainModel
 	}
-	dataChan, _, errChan := h.ExecuteStreamWithAuthManager(ctx, "openai-response", mainModel, responsesReq, "")
-	return collectImagesFromResponsesStream(ctx, dataChan, errChan, responseFormat)
+	out, _, errMsg := h.collectImagesFromResponsesWithRetry(ctx, mainModel, responsesReq, responseFormat)
+	return out, errMsg
 }
 
 func (s *imageAsyncTaskStore) snapshot(taskID string) (*imageAsyncTask, bool) {

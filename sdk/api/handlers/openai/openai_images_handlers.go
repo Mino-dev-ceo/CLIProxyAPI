@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +19,7 @@ import (
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -28,6 +31,16 @@ const (
 	imagesGenerationsPath  = "/v1/images/generations"
 	imagesEditsPath        = "/v1/images/edits"
 )
+
+const (
+	defaultImageStreamMaxAttempts       = 2
+	maxImageStreamMaxAttempts           = 5
+	defaultImageStreamRetryDelayMillis  = 750
+	maxImageStreamRetryDelayMillis      = 10_000
+	imageStreamFailureCooldownErrorCode = "image_stream_disconnected"
+)
+
+var errImagesResponseStreamDisconnected = errors.New("stream disconnected before completion")
 
 type imageCallResult struct {
 	Result        string
@@ -196,6 +209,120 @@ func parseBoolField(raw string, fallback bool) bool {
 	default:
 		return fallback
 	}
+}
+
+func imageStreamEnvInt(name string, fallback int, min int, max int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	if v < min {
+		return min
+	}
+	if max > 0 && v > max {
+		return max
+	}
+	return v
+}
+
+func imageStreamMaxAttempts() int {
+	if raw := strings.TrimSpace(os.Getenv("CPA_IMAGE_STREAM_RETRIES")); raw != "" {
+		retries := imageStreamEnvInt("CPA_IMAGE_STREAM_RETRIES", defaultImageStreamMaxAttempts-1, 0, maxImageStreamMaxAttempts-1)
+		return retries + 1
+	}
+	return imageStreamEnvInt("CPA_IMAGE_STREAM_MAX_ATTEMPTS", defaultImageStreamMaxAttempts, 1, maxImageStreamMaxAttempts)
+}
+
+func imageStreamRetryDelay() time.Duration {
+	ms := imageStreamEnvInt("CPA_IMAGE_STREAM_RETRY_DELAY_MS", defaultImageStreamRetryDelayMillis, 0, maxImageStreamRetryDelayMillis)
+	return time.Duration(ms) * time.Millisecond
+}
+
+func imageStreamRetryBackoff(base time.Duration, attempt int) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	if attempt <= 1 {
+		return base
+	}
+	delay := base
+	for i := 1; i < attempt; i++ {
+		delay *= 2
+		if delay > time.Duration(maxImageStreamRetryDelayMillis)*time.Millisecond {
+			return time.Duration(maxImageStreamRetryDelayMillis) * time.Millisecond
+		}
+	}
+	return delay
+}
+
+func imageStreamErrorText(errMsg *interfaces.ErrorMessage) string {
+	if errMsg == nil || errMsg.Error == nil {
+		return ""
+	}
+	return strings.TrimSpace(errMsg.Error.Error())
+}
+
+func shouldRetryImageStreamError(ctx context.Context, errMsg *interfaces.ErrorMessage) bool {
+	if errMsg == nil || errMsg.Error == nil {
+		return false
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return false
+	}
+	if errors.Is(errMsg.Error, errImagesResponseStreamDisconnected) {
+		return true
+	}
+	text := strings.ToLower(imageStreamErrorText(errMsg))
+	if text == "" {
+		return false
+	}
+	for _, marker := range []string{
+		"stream disconnected",
+		"stream closed before response.completed",
+		"stream id",
+		"internal_error",
+		"internal error",
+		"http2",
+		"unexpected eof",
+		"connection reset",
+		"broken pipe",
+		"server disconnected",
+		"received from peer",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *OpenAIAPIHandler) markImageStreamAuthFailure(ctx context.Context, authID string, model string, errMsg *interfaces.ErrorMessage) {
+	authID = strings.TrimSpace(authID)
+	if authID == "" || h == nil || h.BaseAPIHandler == nil || h.AuthManager == nil || errMsg == nil {
+		return
+	}
+	status := errMsg.StatusCode
+	if status <= 0 {
+		status = http.StatusBadGateway
+	}
+	message := imageStreamErrorText(errMsg)
+	if message == "" {
+		message = http.StatusText(status)
+	}
+	h.AuthManager.MarkResult(ctx, coreauth.Result{
+		AuthID:  authID,
+		Model:   strings.TrimSpace(model),
+		Success: false,
+		Error: &coreauth.Error{
+			Code:       imageStreamFailureCooldownErrorCode,
+			Message:    message,
+			HTTPStatus: status,
+		},
+	})
 }
 
 func (h *OpenAIAPIHandler) ImagesGenerations(c *gin.Context) {
@@ -582,9 +709,7 @@ func (h *OpenAIAPIHandler) collectImagesFromResponses(c *gin.Context, responsesR
 	if mainModel == "" {
 		mainModel = defaultImagesMainModel
 	}
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, "openai-response", mainModel, responsesReq, "")
-
-	out, errMsg := collectImagesFromResponsesStream(cliCtx, dataChan, errChan, responseFormat)
+	out, upstreamHeaders, errMsg := h.collectImagesFromResponsesWithRetry(cliCtx, mainModel, responsesReq, responseFormat)
 	stopKeepAlive()
 	if errMsg != nil {
 		h.WriteErrorResponse(c, errMsg)
@@ -600,8 +725,91 @@ func (h *OpenAIAPIHandler) collectImagesFromResponses(c *gin.Context, responsesR
 	cliCancel()
 }
 
+func (h *OpenAIAPIHandler) collectImagesFromResponsesWithRetry(ctx context.Context, mainModel string, responsesReq []byte, responseFormat string) ([]byte, http.Header, *interfaces.ErrorMessage) {
+	attempts := imageStreamMaxAttempts()
+	delay := imageStreamRetryDelay()
+	var lastErr *interfaces.ErrorMessage
+	var lastHeaders http.Header
+	type imageStreamAuthFailure struct {
+		authID string
+		errMsg *interfaces.ErrorMessage
+	}
+	var authFailures []imageStreamAuthFailure
+
+	for attempt := 1; attempt <= attempts; attempt++ {
+		selectedAuthID := ""
+		attemptCtx := handlers.WithSelectedAuthIDCallback(ctx, func(authID string) {
+			selectedAuthID = strings.TrimSpace(authID)
+		})
+		dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(attemptCtx, "openai-response", mainModel, responsesReq, "")
+		if upstreamHeaders != nil {
+			lastHeaders = upstreamHeaders
+		}
+		out, errMsg := collectImagesFromResponsesStream(attemptCtx, dataChan, errChan, responseFormat)
+		if errMsg == nil {
+			if attempt > 1 {
+				log.Infof("openai images: upstream stream recovered after retry attempt=%d/%d selected_auth=%s", attempt, attempts, selectedAuthID)
+			}
+			for _, failure := range authFailures {
+				if failure.authID != "" && failure.authID == selectedAuthID {
+					continue
+				}
+				h.markImageStreamAuthFailure(ctx, failure.authID, mainModel, failure.errMsg)
+			}
+			return out, upstreamHeaders, nil
+		}
+
+		lastErr = errMsg
+		if attempt >= attempts || !shouldRetryImageStreamError(ctx, errMsg) {
+			break
+		}
+
+		authFailures = append(authFailures, imageStreamAuthFailure{authID: selectedAuthID, errMsg: errMsg})
+		log.Warnf("openai images: upstream stream failed before final image, retrying attempt=%d/%d selected_auth=%s error=%v", attempt+1, attempts, selectedAuthID, errMsg.Error)
+
+		if wait := imageStreamRetryBackoff(delay, attempt); wait > 0 {
+			timer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return nil, lastHeaders, &interfaces.ErrorMessage{StatusCode: http.StatusRequestTimeout, Error: ctx.Err()}
+			case <-timer.C:
+			}
+		}
+	}
+
+	for _, failure := range authFailures {
+		h.markImageStreamAuthFailure(ctx, failure.authID, mainModel, failure.errMsg)
+	}
+	return nil, lastHeaders, lastErr
+}
+
 func collectImagesFromResponsesStream(ctx context.Context, data <-chan []byte, errs <-chan *interfaces.ErrorMessage, responseFormat string) ([]byte, *interfaces.ErrorMessage) {
 	acc := &sseFrameAccumulator{}
+	var fallbackResults []imageCallResult
+	var fallbackCreatedAt int64
+	var fallbackFirstMeta imageCallResult
+
+	buildFallbackResponse := func() ([]byte, *interfaces.ErrorMessage) {
+		if len(fallbackResults) == 0 {
+			return nil, nil
+		}
+		createdAt := fallbackCreatedAt
+		if createdAt <= 0 {
+			createdAt = time.Now().Unix()
+		}
+		out, err := buildImagesAPIResponse(ctx, fallbackResults, createdAt, nil, fallbackFirstMeta, responseFormat)
+		if err != nil {
+			return nil, &interfaces.ErrorMessage{StatusCode: http.StatusInternalServerError, Error: err}
+		}
+		log.Warnf("openai images: stream closed before response.completed; recovered image result from response.output_item.done")
+		return out, nil
+	}
 
 	processFrame := func(frame []byte) ([]byte, bool, *interfaces.ErrorMessage) {
 		for _, line := range bytes.Split(frame, []byte("\n")) {
@@ -620,7 +828,21 @@ func collectImagesFromResponsesStream(ctx context.Context, data <-chan []byte, e
 				return nil, false, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("invalid SSE data JSON")}
 			}
 
-			if gjson.GetBytes(payload, "type").String() != "response.completed" {
+			eventType := gjson.GetBytes(payload, "type").String()
+			if eventType == "response.output_item.done" {
+				results, createdAt, firstMeta := extractImagesFromResponsesOutputItemDone(payload)
+				if len(results) > 0 {
+					if fallbackCreatedAt <= 0 {
+						fallbackCreatedAt = createdAt
+					}
+					if len(fallbackResults) == 0 {
+						fallbackFirstMeta = firstMeta
+					}
+					fallbackResults = append(fallbackResults, results...)
+				}
+				continue
+			}
+			if eventType != "response.completed" {
 				continue
 			}
 
@@ -646,6 +868,11 @@ func collectImagesFromResponsesStream(ctx context.Context, data <-chan []byte, e
 			return nil, &interfaces.ErrorMessage{StatusCode: http.StatusRequestTimeout, Error: ctx.Err()}
 		case errMsg, ok := <-errs:
 			if ok && errMsg != nil {
+				if out, fallbackErr := buildFallbackResponse(); fallbackErr != nil {
+					return nil, fallbackErr
+				} else if out != nil {
+					return out, nil
+				}
 				return nil, errMsg
 			}
 			errs = nil
@@ -658,7 +885,12 @@ func collectImagesFromResponsesStream(ctx context.Context, data <-chan []byte, e
 						return out, nil
 					}
 				}
-				return nil, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("stream disconnected before completion")}
+				if out, fallbackErr := buildFallbackResponse(); fallbackErr != nil {
+					return nil, fallbackErr
+				} else if out != nil {
+					return out, nil
+				}
+				return nil, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errImagesResponseStreamDisconnected}
 			}
 			for _, frame := range acc.AddChunk(chunk) {
 				if out, done, errMsg := processFrame(frame); errMsg != nil {
@@ -669,6 +901,44 @@ func collectImagesFromResponsesStream(ctx context.Context, data <-chan []byte, e
 			}
 		}
 	}
+}
+
+func imageCallResultFromResponsesItem(item gjson.Result) (imageCallResult, bool) {
+	if item.Get("type").String() != "image_generation_call" {
+		return imageCallResult{}, false
+	}
+	res := strings.TrimSpace(item.Get("result").String())
+	if res == "" {
+		return imageCallResult{}, false
+	}
+	return imageCallResult{
+		Result:        res,
+		RevisedPrompt: strings.TrimSpace(item.Get("revised_prompt").String()),
+		OutputFormat:  strings.TrimSpace(item.Get("output_format").String()),
+		Size:          strings.TrimSpace(item.Get("size").String()),
+		Background:    strings.TrimSpace(item.Get("background").String()),
+		Quality:       strings.TrimSpace(item.Get("quality").String()),
+	}, true
+}
+
+func extractImagesFromResponsesOutputItemDone(payload []byte) (results []imageCallResult, createdAt int64, firstMeta imageCallResult) {
+	if gjson.GetBytes(payload, "type").String() != "response.output_item.done" {
+		return nil, 0, imageCallResult{}
+	}
+	createdAt = gjson.GetBytes(payload, "response.created_at").Int()
+	if createdAt <= 0 {
+		createdAt = gjson.GetBytes(payload, "created_at").Int()
+	}
+	if createdAt <= 0 {
+		createdAt = time.Now().Unix()
+	}
+
+	for _, path := range []string{"item", "output_item"} {
+		if entry, ok := imageCallResultFromResponsesItem(gjson.GetBytes(payload, path)); ok {
+			return []imageCallResult{entry}, createdAt, entry
+		}
+	}
+	return nil, createdAt, imageCallResult{}
 }
 
 func extractImagesFromResponsesCompleted(payload []byte) (results []imageCallResult, createdAt int64, usageRaw []byte, firstMeta imageCallResult, err error) {
@@ -684,20 +954,9 @@ func extractImagesFromResponsesCompleted(payload []byte) (results []imageCallRes
 	output := gjson.GetBytes(payload, "response.output")
 	if output.IsArray() {
 		for _, item := range output.Array() {
-			if item.Get("type").String() != "image_generation_call" {
+			entry, ok := imageCallResultFromResponsesItem(item)
+			if !ok {
 				continue
-			}
-			res := strings.TrimSpace(item.Get("result").String())
-			if res == "" {
-				continue
-			}
-			entry := imageCallResult{
-				Result:        res,
-				RevisedPrompt: strings.TrimSpace(item.Get("revised_prompt").String()),
-				OutputFormat:  strings.TrimSpace(item.Get("output_format").String()),
-				Size:          strings.TrimSpace(item.Get("size").String()),
-				Background:    strings.TrimSpace(item.Get("background").String()),
-				Quality:       strings.TrimSpace(item.Get("quality").String()),
 			}
 			if len(results) == 0 {
 				firstMeta = entry
