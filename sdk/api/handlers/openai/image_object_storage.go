@@ -79,6 +79,10 @@ func imageObjectStorageConfigured() bool {
 }
 
 func loadImageObjectStorageConfig() (imageObjectStorageConfig, error) {
+	if rawEnabled := firstImageObjectEnv("CPA_IMAGE_OBJECT_STORAGE_ENABLED", "CPA_IMAGE_R2_ENABLED"); rawEnabled != "" && !parseBoolField(rawEnabled, true) {
+		return imageObjectStorageConfig{}, errImageObjectStorageNotConfigured
+	}
+
 	rawEndpoint := firstImageObjectEnv("CPA_IMAGE_R2_ENDPOINT", "CPA_R2_ENDPOINT", "R2_ENDPOINT")
 	bucket := firstImageObjectEnv("CPA_IMAGE_R2_BUCKET", "CPA_R2_BUCKET", "R2_BUCKET")
 	accessKey := firstImageObjectEnv("CPA_IMAGE_R2_ACCESS_KEY_ID", "CPA_IMAGE_R2_ACCESS_KEY", "CPA_R2_ACCESS_KEY_ID", "R2_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID")

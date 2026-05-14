@@ -371,6 +371,14 @@ func (s *Server) setupRoutes() {
 	s.engine.GET("/healthz", healthzHandler)
 	s.engine.HEAD("/healthz", healthzHandler)
 
+	faviconHandler := func(c *gin.Context) {
+		logging.SkipGinRequestLogging(c)
+		c.Header("Cache-Control", "public, max-age=86400")
+		c.Status(http.StatusNoContent)
+	}
+	s.engine.GET("/favicon.ico", faviconHandler)
+	s.engine.HEAD("/favicon.ico", faviconHandler)
+
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
@@ -592,7 +600,10 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/gemini-api-key", s.mgmt.PatchGeminiKey)
 		mgmt.DELETE("/gemini-api-key", s.mgmt.DeleteGeminiKey)
 
-		mgmt.GET("/logs", s.mgmt.GetLogs)
+		mgmt.GET("/logs", func(c *gin.Context) {
+			logging.SkipGinRequestLogging(c)
+			s.mgmt.GetLogs(c)
+		})
 		mgmt.DELETE("/logs", s.mgmt.DeleteLogs)
 		mgmt.GET("/request-error-logs", s.mgmt.GetRequestErrorLogs)
 		mgmt.GET("/request-error-logs/:name", s.mgmt.DownloadRequestErrorLog)

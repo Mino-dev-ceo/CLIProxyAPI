@@ -27,6 +27,8 @@ func resetImageObjectEnvForTest(t *testing.T) {
 	t.Helper()
 	for _, name := range []string{
 		"CPA_IMAGE_R2_ENDPOINT",
+		"CPA_IMAGE_OBJECT_STORAGE_ENABLED",
+		"CPA_IMAGE_R2_ENABLED",
 		"CPA_R2_ENDPOINT",
 		"R2_ENDPOINT",
 		"CPA_IMAGE_R2_BUCKET",
@@ -158,6 +160,20 @@ func TestNormalizeImagesResponseFormatDefaultsToURLWithStorage(t *testing.T) {
 
 	if got := normalizeImagesResponseFormat(""); got != "url" {
 		t.Fatalf("response format = %q, want url", got)
+	}
+}
+
+func TestNormalizeImagesResponseFormatCanDisableObjectStorage(t *testing.T) {
+	resetImageObjectEnvForTest(t)
+	t.Setenv("CPA_IMAGE_OBJECT_STORAGE_ENABLED", "false")
+	t.Setenv("CPA_IMAGE_R2_ENDPOINT", "https://example.r2.cloudflarestorage.com")
+	t.Setenv("CPA_IMAGE_R2_BUCKET", "images")
+	t.Setenv("CPA_IMAGE_R2_ACCESS_KEY_ID", "access")
+	t.Setenv("CPA_IMAGE_R2_SECRET_ACCESS_KEY", "secret")
+	resetImageObjectStorageForTest()
+
+	if got := normalizeImagesResponseFormat(""); got != "b64_json" {
+		t.Fatalf("response format = %q, want b64_json", got)
 	}
 }
 
