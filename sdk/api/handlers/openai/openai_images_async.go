@@ -403,9 +403,6 @@ func prepareImageGenerationAsyncRequest(rawJSON []byte) (*imageAsyncPreparedRequ
 	}
 
 	responseFormat := strings.TrimSpace(gjson.GetBytes(rawJSON, "response_format").String())
-	if responseFormat == "" {
-		responseFormat = "b64_json"
-	}
 
 	tool := []byte(`{"type":"image_generation","action":"generate"}`)
 	tool, _ = sjson.SetBytes(tool, "model", imageModel)
@@ -486,9 +483,6 @@ func prepareImageEditAsyncJSONRequest(rawJSON []byte) (*imageAsyncPreparedReques
 	}
 
 	responseFormat := strings.TrimSpace(gjson.GetBytes(rawJSON, "response_format").String())
-	if responseFormat == "" {
-		responseFormat = "b64_json"
-	}
 
 	tool := []byte(`{"type":"image_generation","action":"edit"}`)
 	tool, _ = sjson.SetBytes(tool, "model", imageModel)
@@ -567,9 +561,6 @@ func prepareImageEditAsyncMultipartRequest(c *gin.Context) (*imageAsyncPreparedR
 	}
 
 	responseFormat := strings.TrimSpace(c.PostForm("response_format"))
-	if responseFormat == "" {
-		responseFormat = "b64_json"
-	}
 
 	tool := []byte(`{"type":"image_generation","action":"edit"}`)
 	tool, _ = sjson.SetBytes(tool, "model", imageModel)

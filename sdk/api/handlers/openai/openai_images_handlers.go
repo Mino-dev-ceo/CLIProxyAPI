@@ -244,9 +244,6 @@ func (h *OpenAIAPIHandler) ImagesGenerations(c *gin.Context) {
 	}
 
 	responseFormat := strings.TrimSpace(gjson.GetBytes(rawJSON, "response_format").String())
-	if responseFormat == "" {
-		responseFormat = "b64_json"
-	}
 	stream := gjson.GetBytes(rawJSON, "stream").Bool()
 
 	tool := []byte(`{"type":"image_generation","action":"generate"}`)
@@ -388,9 +385,6 @@ func (h *OpenAIAPIHandler) imagesEditsFromMultipart(c *gin.Context) {
 	}
 
 	responseFormat := strings.TrimSpace(c.PostForm("response_format"))
-	if responseFormat == "" {
-		responseFormat = "b64_json"
-	}
 	stream := parseBoolField(c.PostForm("stream"), false)
 
 	tool := []byte(`{"type":"image_generation","action":"edit"}`)
@@ -512,9 +506,6 @@ func (h *OpenAIAPIHandler) imagesEditsFromJSON(c *gin.Context) {
 	}
 
 	responseFormat := strings.TrimSpace(gjson.GetBytes(rawJSON, "response_format").String())
-	if responseFormat == "" {
-		responseFormat = "b64_json"
-	}
 	stream := gjson.GetBytes(rawJSON, "stream").Bool()
 
 	tool := []byte(`{"type":"image_generation","action":"edit"}`)
@@ -640,7 +631,7 @@ func collectImagesFromResponsesStream(ctx context.Context, data <-chan []byte, e
 			if len(results) == 0 {
 				return nil, false, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("upstream did not return image output")}
 			}
-			out, err := buildImagesAPIResponse(results, createdAt, usageRaw, firstMeta, responseFormat)
+			out, err := buildImagesAPIResponse(ctx, results, createdAt, usageRaw, firstMeta, responseFormat)
 			if err != nil {
 				return nil, false, &interfaces.ErrorMessage{StatusCode: http.StatusInternalServerError, Error: err}
 			}
@@ -722,25 +713,16 @@ func extractImagesFromResponsesCompleted(payload []byte) (results []imageCallRes
 	return results, createdAt, usageRaw, firstMeta, nil
 }
 
-func buildImagesAPIResponse(results []imageCallResult, createdAt int64, usageRaw []byte, firstMeta imageCallResult, responseFormat string) ([]byte, error) {
+func buildImagesAPIResponse(ctx context.Context, results []imageCallResult, createdAt int64, usageRaw []byte, firstMeta imageCallResult, responseFormat string) ([]byte, error) {
 	out := []byte(`{"created":0,"data":[]}`)
 	out, _ = sjson.SetBytes(out, "created", createdAt)
 
-	responseFormat = strings.ToLower(strings.TrimSpace(responseFormat))
-	if responseFormat == "" {
-		responseFormat = "b64_json"
-	}
+	responseFormat = normalizeImagesResponseFormat(responseFormat)
 
-	for _, img := range results {
-		item := []byte(`{}`)
-		if responseFormat == "url" {
-			mt := mimeTypeFromOutputFormat(img.OutputFormat)
-			item, _ = sjson.SetBytes(item, "url", "data:"+mt+";base64,"+img.Result)
-		} else {
-			item, _ = sjson.SetBytes(item, "b64_json", img.Result)
-		}
-		if img.RevisedPrompt != "" {
-			item, _ = sjson.SetBytes(item, "revised_prompt", img.RevisedPrompt)
+	for i, img := range results {
+		item, err := imageCallResultToOpenAIItem(ctx, img, i, responseFormat)
+		if err != nil {
+			return nil, err
 		}
 		out, _ = sjson.SetRawBytes(out, "data.-1", item)
 	}
@@ -840,10 +822,7 @@ func (h *OpenAIAPIHandler) streamImagesFromResponses(c *gin.Context, responsesRe
 func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, firstChunk []byte, responseFormat string, streamPrefix string, writeEvent func(string, []byte)) {
 	acc := &sseFrameAccumulator{}
 
-	responseFormat = strings.ToLower(strings.TrimSpace(responseFormat))
-	if responseFormat == "" {
-		responseFormat = "b64_json"
-	}
+	responseFormat = normalizeImagesResponseFormat(responseFormat)
 
 	emitError := func(errMsg *interfaces.ErrorMessage) {
 		if errMsg == nil {
@@ -902,12 +881,21 @@ func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Conte
 					return true
 				}
 				eventName := streamPrefix + ".completed"
-				for _, img := range results {
+				for i, img := range results {
 					data := []byte(`{"type":""}`)
 					data, _ = sjson.SetBytes(data, "type", eventName)
 					if responseFormat == "url" {
-						mt := mimeTypeFromOutputFormat(img.OutputFormat)
-						data, _ = sjson.SetBytes(data, "url", "data:"+mt+";base64,"+img.Result)
+						item, err := imageCallResultToOpenAIItem(ctx, img, i, responseFormat)
+						if err != nil {
+							emitError(&interfaces.ErrorMessage{StatusCode: http.StatusInternalServerError, Error: err})
+							return true
+						}
+						if urlValue := gjson.GetBytes(item, "url").String(); urlValue != "" {
+							data, _ = sjson.SetBytes(data, "url", urlValue)
+						}
+						if objectKey := gjson.GetBytes(item, "object_key").String(); objectKey != "" {
+							data, _ = sjson.SetBytes(data, "object_key", objectKey)
+						}
 					} else {
 						data, _ = sjson.SetBytes(data, "b64_json", img.Result)
 					}

@@ -2,6 +2,7 @@ package openai
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -15,6 +16,33 @@ import (
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	"github.com/tidwall/gjson"
 )
+
+func resetImageObjectEnvForTest(t *testing.T) {
+	t.Helper()
+	for _, name := range []string{
+		"CPA_IMAGE_R2_ENDPOINT",
+		"CPA_R2_ENDPOINT",
+		"R2_ENDPOINT",
+		"CPA_IMAGE_R2_BUCKET",
+		"CPA_R2_BUCKET",
+		"R2_BUCKET",
+		"CPA_IMAGE_R2_ACCESS_KEY_ID",
+		"CPA_IMAGE_R2_ACCESS_KEY",
+		"CPA_R2_ACCESS_KEY_ID",
+		"R2_ACCESS_KEY_ID",
+		"AWS_ACCESS_KEY_ID",
+		"CPA_IMAGE_R2_SECRET_ACCESS_KEY",
+		"CPA_IMAGE_R2_SECRET_KEY",
+		"CPA_R2_SECRET_ACCESS_KEY",
+		"R2_SECRET_ACCESS_KEY",
+		"AWS_SECRET_ACCESS_KEY",
+		"CPA_IMAGE_DEFAULT_RESPONSE_FORMAT",
+	} {
+		t.Setenv(name, "")
+	}
+	resetImageObjectStorageForTest()
+	t.Cleanup(resetImageObjectStorageForTest)
+}
 
 func performImagesEndpointRequest(t *testing.T, endpointPath string, contentType string, body io.Reader, handler gin.HandlerFunc) *httptest.ResponseRecorder {
 	t.Helper()
@@ -57,6 +85,44 @@ func TestImagesModelValidationAllowsGPTImage2WithOptionalPrefix(t *testing.T) {
 	}
 	if isSupportedImagesModel("gpt-5.4-mini") {
 		t.Fatal("expected gpt-5.4-mini to be rejected")
+	}
+}
+
+func TestNormalizeImagesResponseFormatDefaultsToB64WithoutStorage(t *testing.T) {
+	resetImageObjectEnvForTest(t)
+
+	if got := normalizeImagesResponseFormat(""); got != "b64_json" {
+		t.Fatalf("response format = %q, want b64_json", got)
+	}
+}
+
+func TestNormalizeImagesResponseFormatDefaultsToURLWithStorage(t *testing.T) {
+	resetImageObjectEnvForTest(t)
+	t.Setenv("CPA_IMAGE_R2_ENDPOINT", "https://example.r2.cloudflarestorage.com")
+	t.Setenv("CPA_IMAGE_R2_BUCKET", "images")
+	t.Setenv("CPA_IMAGE_R2_ACCESS_KEY_ID", "access")
+	t.Setenv("CPA_IMAGE_R2_SECRET_ACCESS_KEY", "secret")
+	resetImageObjectStorageForTest()
+
+	if got := normalizeImagesResponseFormat(""); got != "url" {
+		t.Fatalf("response format = %q, want url", got)
+	}
+}
+
+func TestBuildImagesAPIResponseURLFallsBackToDataURLWithoutStorage(t *testing.T) {
+	resetImageObjectEnvForTest(t)
+
+	out, err := buildImagesAPIResponse(context.Background(), []imageCallResult{
+		{Result: "AA==", OutputFormat: "png", RevisedPrompt: "tiny"},
+	}, 123, nil, imageCallResult{}, "url")
+	if err != nil {
+		t.Fatalf("buildImagesAPIResponse returned error: %v", err)
+	}
+	if got := gjson.GetBytes(out, "data.0.url").String(); got != "data:image/png;base64,AA==" {
+		t.Fatalf("url = %q, want data URL fallback", got)
+	}
+	if got := gjson.GetBytes(out, "data.0.revised_prompt").String(); got != "tiny" {
+		t.Fatalf("revised_prompt = %q, want tiny", got)
 	}
 }
 
