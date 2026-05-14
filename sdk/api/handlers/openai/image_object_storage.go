@@ -111,7 +111,7 @@ func loadImageObjectStorageConfig() (imageObjectStorageConfig, error) {
 		SecretKey:  secretKey,
 		Region:     region,
 		Prefix:     prefix,
-		PublicBase: strings.TrimRight(firstImageObjectEnv("CPA_IMAGE_R2_PUBLIC_BASE_URL", "CPA_R2_PUBLIC_BASE_URL", "R2_PUBLIC_BASE_URL"), "/"),
+		PublicBase: normalizeImageObjectPublicBase(firstImageObjectEnv("CPA_IMAGE_R2_PUBLIC_BASE_URL", "CPA_R2_PUBLIC_BASE_URL", "R2_PUBLIC_BASE_URL")),
 		UseSSL:     useSSL,
 	}, nil
 }
@@ -141,6 +141,17 @@ func normalizeImageObjectEndpoint(rawEndpoint string) (string, bool, error) {
 		return parsed.Host, parsed.Scheme == "https", nil
 	}
 	return rawEndpoint, true, nil
+}
+
+func normalizeImageObjectPublicBase(rawPublicBase string) string {
+	rawPublicBase = strings.TrimRight(strings.TrimSpace(rawPublicBase), "/")
+	if rawPublicBase == "" {
+		return ""
+	}
+	if strings.HasPrefix(rawPublicBase, "http://") || strings.HasPrefix(rawPublicBase, "https://") {
+		return rawPublicBase
+	}
+	return "https://" + rawPublicBase
 }
 
 func normalizeImagesResponseFormat(responseFormat string) string {

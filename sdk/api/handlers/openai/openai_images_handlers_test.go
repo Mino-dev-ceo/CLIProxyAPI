@@ -126,6 +126,15 @@ func TestBuildImagesAPIResponseURLFallsBackToDataURLWithoutStorage(t *testing.T)
 	}
 }
 
+func TestNormalizeImageObjectPublicBaseAddsHTTPS(t *testing.T) {
+	if got := normalizeImageObjectPublicBase("image.minotoken.xyz/"); got != "https://image.minotoken.xyz" {
+		t.Fatalf("public base = %q, want https://image.minotoken.xyz", got)
+	}
+	if got := normalizeImageObjectPublicBase("https://image.minotoken.xyz/"); got != "https://image.minotoken.xyz" {
+		t.Fatalf("public base = %q, want https://image.minotoken.xyz", got)
+	}
+}
+
 func TestImagesGenerationsRejectsUnsupportedModel(t *testing.T) {
 	handler := &OpenAIAPIHandler{}
 	body := strings.NewReader(`{"model":"gpt-5.4-mini","prompt":"draw a square"}`)
