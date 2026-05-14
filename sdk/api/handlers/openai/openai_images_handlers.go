@@ -325,6 +325,34 @@ func (h *OpenAIAPIHandler) markImageStreamAuthFailure(ctx context.Context, authI
 	})
 }
 
+func (h *OpenAIAPIHandler) hasAlternativeImageStreamAuth(authID string, model string) bool {
+	authID = strings.TrimSpace(authID)
+	model = strings.TrimSpace(model)
+	if authID == "" || model == "" || h == nil || h.BaseAPIHandler == nil || h.AuthManager == nil {
+		return false
+	}
+	now := time.Now()
+	for _, auth := range h.AuthManager.List() {
+		if auth == nil || strings.TrimSpace(auth.ID) == "" || strings.TrimSpace(auth.ID) == authID {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+			continue
+		}
+		if auth.Disabled || auth.Status == coreauth.StatusDisabled {
+			continue
+		}
+		if auth.NextRetryAfter.After(now) {
+			continue
+		}
+		if state := auth.ModelStates[model]; state != nil && state.Unavailable && state.NextRetryAfter.After(now) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
 func (h *OpenAIAPIHandler) ImagesGenerations(c *gin.Context) {
 	if h != nil && h.BaseAPIHandler != nil && h.BaseAPIHandler.Cfg != nil && h.BaseAPIHandler.Cfg.DisableImageGeneration == internalconfig.DisableImageGenerationAll {
 		c.AbortWithStatus(http.StatusNotFound)
@@ -730,11 +758,6 @@ func (h *OpenAIAPIHandler) collectImagesFromResponsesWithRetry(ctx context.Conte
 	delay := imageStreamRetryDelay()
 	var lastErr *interfaces.ErrorMessage
 	var lastHeaders http.Header
-	type imageStreamAuthFailure struct {
-		authID string
-		errMsg *interfaces.ErrorMessage
-	}
-	var authFailures []imageStreamAuthFailure
 
 	for attempt := 1; attempt <= attempts; attempt++ {
 		selectedAuthID := ""
@@ -750,12 +773,6 @@ func (h *OpenAIAPIHandler) collectImagesFromResponsesWithRetry(ctx context.Conte
 			if attempt > 1 {
 				log.Infof("openai images: upstream stream recovered after retry attempt=%d/%d selected_auth=%s", attempt, attempts, selectedAuthID)
 			}
-			for _, failure := range authFailures {
-				if failure.authID != "" && failure.authID == selectedAuthID {
-					continue
-				}
-				h.markImageStreamAuthFailure(ctx, failure.authID, mainModel, failure.errMsg)
-			}
 			return out, upstreamHeaders, nil
 		}
 
@@ -764,7 +781,9 @@ func (h *OpenAIAPIHandler) collectImagesFromResponsesWithRetry(ctx context.Conte
 			break
 		}
 
-		authFailures = append(authFailures, imageStreamAuthFailure{authID: selectedAuthID, errMsg: errMsg})
+		if h.hasAlternativeImageStreamAuth(selectedAuthID, mainModel) {
+			h.markImageStreamAuthFailure(ctx, selectedAuthID, mainModel, errMsg)
+		}
 		log.Warnf("openai images: upstream stream failed before final image, retrying attempt=%d/%d selected_auth=%s error=%v", attempt+1, attempts, selectedAuthID, errMsg.Error)
 
 		if wait := imageStreamRetryBackoff(delay, attempt); wait > 0 {
@@ -783,9 +802,6 @@ func (h *OpenAIAPIHandler) collectImagesFromResponsesWithRetry(ctx context.Conte
 		}
 	}
 
-	for _, failure := range authFailures {
-		h.markImageStreamAuthFailure(ctx, failure.authID, mainModel, failure.errMsg)
-	}
 	return nil, lastHeaders, lastErr
 }
 
