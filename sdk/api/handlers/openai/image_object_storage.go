@@ -246,6 +246,20 @@ func (s *imageObjectStorage) objectURL(ctx context.Context, key string) (string,
 	return presigned.String(), nil
 }
 
+func (s *imageObjectStorage) deleteObject(ctx context.Context, key string) error {
+	if s == nil || s.client == nil {
+		return errImageObjectStorageNotConfigured
+	}
+	key = strings.Trim(strings.TrimSpace(key), "/")
+	if key == "" {
+		return nil
+	}
+	if err := s.client.RemoveObject(ctx, s.cfg.Bucket, key, minio.RemoveObjectOptions{}); err != nil {
+		return fmt.Errorf("image object storage: delete %s: %w", key, err)
+	}
+	return nil
+}
+
 func decodeGeneratedImageBase64(payload string) ([]byte, error) {
 	normalized := strings.Map(func(r rune) rune {
 		if r == '\r' || r == '\n' || r == '\t' || r == ' ' {

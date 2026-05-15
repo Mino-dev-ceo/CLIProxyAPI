@@ -113,6 +113,10 @@ func TestImageAsyncTaskResponseHidesUpscaleSourceURL(t *testing.T) {
 	job, err := store.create(upscaleJobCreateRequest{
 		SourceImageURL: "https://cdn.example.com/source-2k.png",
 		TargetLongEdge: 4096,
+		Metadata: map[string]any{
+			"image_task_id":     "task_123",
+			"source_object_key": "images/source-2k.png",
+		},
 	})
 	if err != nil {
 		t.Fatalf("create job: %v", err)
@@ -134,6 +138,15 @@ func TestImageAsyncTaskResponseHidesUpscaleSourceURL(t *testing.T) {
 	}
 	if got := gjson.GetBytes(pendingRaw, "response.data.0.url").String(); got != "" {
 		t.Fatalf("pending response source url = %q, want hidden", got)
+	}
+	if got := gjson.GetBytes(pendingRaw, "upscale_job.source_image_url").String(); got != "" {
+		t.Fatalf("pending upscale source url = %q, want hidden", got)
+	}
+	if got := gjson.GetBytes(pendingRaw, "upscale_job.metadata.source_object_key").String(); got != "" {
+		t.Fatalf("pending source object key = %q, want hidden", got)
+	}
+	if got := gjson.GetBytes(pendingRaw, "upscale_job.metadata.image_task_id").String(); got != "task_123" {
+		t.Fatalf("pending image_task_id = %q, want task_123", got)
 	}
 
 	if _, ok, err := store.claim("mac-1"); err != nil || !ok {

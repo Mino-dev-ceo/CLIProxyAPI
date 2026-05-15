@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -351,7 +353,50 @@ func (s *upscaleJobStore) workerUpdate(jobID string, workerID string, action str
 	}); err != nil {
 		return nil, err
 	}
+	if action == "complete" || action == "fail" {
+		cleanupUpscaleSourceObject(updated)
+	}
 	return updated, nil
+}
+
+func cleanupUpscaleSourceObject(job *upscaleJob) {
+	key := upscaleSourceObjectKey(job)
+	if key == "" || !deleteUpscaleSourceObjectEnabled() {
+		return
+	}
+	storage, err := getImageObjectStorage()
+	if err != nil {
+		log.WithError(err).WithField("job_id", job.ID).Warn("upscale source cleanup skipped")
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := storage.deleteObject(ctx, key); err != nil {
+		log.WithError(err).WithFields(log.Fields{
+			"job_id": job.ID,
+			"key":    key,
+		}).Warn("upscale source cleanup failed")
+		return
+	}
+	log.WithFields(log.Fields{
+		"job_id": job.ID,
+		"key":    key,
+	}).Info("upscale source object deleted")
+}
+
+func upscaleSourceObjectKey(job *upscaleJob) string {
+	if job == nil || len(job.Metadata) == 0 {
+		return ""
+	}
+	return strings.Trim(strings.TrimSpace(valueAsString(job.Metadata["source_object_key"])), "/")
+}
+
+func deleteUpscaleSourceObjectEnabled() bool {
+	raw := strings.TrimSpace(firstImageObjectEnv("CPA_UPSCALE_DELETE_SOURCE_OBJECT", "CPA_IMAGE_DELETE_UPSCALE_SOURCE"))
+	if raw == "" {
+		return true
+	}
+	return parseBoolField(raw, true)
 }
 
 func (s *upscaleJobStore) load() error {
@@ -531,7 +576,6 @@ func publicUpscaleJob(job *upscaleJob) gin.H {
 	out := gin.H{
 		"id":               job.ID,
 		"status":           job.Status,
-		"source_image_url": job.SourceImageURL,
 		"result_image_url": job.ResultImageURL,
 		"source_width":     job.SourceWidth,
 		"source_height":    job.SourceHeight,
@@ -548,11 +592,28 @@ func publicUpscaleJob(job *upscaleJob) gin.H {
 		"finished_at":      job.FinishedAt,
 		"updated_at":       job.UpdatedAt,
 	}
-	if len(job.Metadata) > 0 {
-		out["metadata"] = job.Metadata
+	if metadata := publicUpscaleMetadata(job.Metadata); len(metadata) > 0 {
+		out["metadata"] = metadata
 	}
 	if len(job.Summary) > 0 {
 		out["summary"] = job.Summary
+	}
+	return out
+}
+
+func publicUpscaleMetadata(metadata map[string]any) map[string]any {
+	if len(metadata) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(metadata))
+	for key, value := range metadata {
+		if key == "source_object_key" {
+			continue
+		}
+		out[key] = value
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }
