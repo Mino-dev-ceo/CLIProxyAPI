@@ -106,6 +106,60 @@ func TestCreateUpscaleJobsFromImageResponse(t *testing.T) {
 	}
 }
 
+func TestImageAsyncTaskResponseHidesUpscaleSourceURL(t *testing.T) {
+	resetUpscaleJobStoreForTest(t)
+
+	store := getUpscaleJobStore()
+	job, err := store.create(upscaleJobCreateRequest{
+		SourceImageURL: "https://cdn.example.com/source-2k.png",
+		TargetLongEdge: 4096,
+	})
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	task := &imageAsyncTask{
+		ID:            "task_123",
+		Status:        imageTaskStatusSucceeded,
+		Response:      []byte(`{"created":123,"data":[{"url":"https://cdn.example.com/source-2k.png","object_key":"images/source-2k.png"}]}`),
+		Upscale:       true,
+		UpscaleJobIDs: []string{job.ID},
+	}
+
+	pendingRaw, err := jsonMarshalForTest(imageAsyncTaskResponse(task))
+	if err != nil {
+		t.Fatalf("marshal pending response: %v", err)
+	}
+	if got := gjson.GetBytes(pendingRaw, "data.0.url").String(); got != "" {
+		t.Fatalf("pending data url = %q, want hidden", got)
+	}
+	if got := gjson.GetBytes(pendingRaw, "response.data.0.url").String(); got != "" {
+		t.Fatalf("pending response source url = %q, want hidden", got)
+	}
+
+	if _, ok, err := store.claim("mac-1"); err != nil || !ok {
+		t.Fatalf("claim job ok=%t err=%v", ok, err)
+	}
+	if _, err := store.workerUpdate(job.ID, "mac-1", "complete", map[string]any{
+		"result_image_url": "https://cdn.example.com/final-4k.png",
+	}); err != nil {
+		t.Fatalf("complete job: %v", err)
+	}
+
+	finalRaw, err := jsonMarshalForTest(imageAsyncTaskResponse(task))
+	if err != nil {
+		t.Fatalf("marshal final response: %v", err)
+	}
+	if got := gjson.GetBytes(finalRaw, "data.0.url").String(); got != "https://cdn.example.com/final-4k.png" {
+		t.Fatalf("final data url = %q, want final 4k url", got)
+	}
+	if got := gjson.GetBytes(finalRaw, "response.data.0.url").String(); got != "" {
+		t.Fatalf("final response source url = %q, want hidden", got)
+	}
+	if got := gjson.GetBytes(finalRaw, "final_url").String(); got != "https://cdn.example.com/final-4k.png" {
+		t.Fatalf("final_url = %q, want final 4k url", got)
+	}
+}
+
 func jsonMarshalForTest(v any) ([]byte, error) {
 	return json.Marshal(v)
 }

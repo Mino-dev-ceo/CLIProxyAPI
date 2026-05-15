@@ -409,19 +409,20 @@ func imageAsyncTaskResponse(task *imageAsyncTask) gin.H {
 	if task.Upscale {
 		resp["upscale"] = true
 	}
+	var upscaleJobs []gin.H
 	if len(task.UpscaleJobIDs) > 0 {
-		jobs := make([]gin.H, 0, len(task.UpscaleJobIDs))
+		upscaleJobs = make([]gin.H, 0, len(task.UpscaleJobIDs))
 		for _, jobID := range task.UpscaleJobIDs {
 			if job, ok := getUpscaleJobStore().snapshot(jobID); ok {
-				jobs = append(jobs, publicUpscaleJob(job))
+				upscaleJobs = append(upscaleJobs, publicUpscaleJob(job))
 			} else {
-				jobs = append(jobs, gin.H{"id": jobID, "status": "unknown"})
+				upscaleJobs = append(upscaleJobs, gin.H{"id": jobID, "status": "unknown"})
 			}
 		}
-		resp["upscale_jobs"] = jobs
-		if len(jobs) == 1 {
-			resp["upscale_job"] = jobs[0]
-			if url, _ := jobs[0]["result_image_url"].(string); strings.TrimSpace(url) != "" {
+		resp["upscale_jobs"] = upscaleJobs
+		if len(upscaleJobs) == 1 {
+			resp["upscale_job"] = upscaleJobs[0]
+			if url, _ := upscaleJobs[0]["result_image_url"].(string); strings.TrimSpace(url) != "" {
 				resp["result_image_url"] = url
 				resp["final_url"] = url
 			}
@@ -449,6 +450,18 @@ func imageAsyncTaskResponse(task *imageAsyncTask) gin.H {
 
 	var payload map[string]any
 	if err := json.Unmarshal(task.Response, &payload); err == nil {
+		if task.Upscale {
+			if finalData := finalImageDataFromUpscaleJobs(upscaleJobs); len(finalData) > 0 {
+				resp["data"] = finalData
+			}
+			if created, ok := payload["created"]; ok {
+				resp["created"] = created
+			}
+			if usage, ok := payload["usage"]; ok {
+				resp["usage"] = usage
+			}
+			return resp
+		}
 		resp["response"] = payload
 		if data, ok := payload["data"]; ok {
 			resp["data"] = data
@@ -461,6 +474,25 @@ func imageAsyncTaskResponse(task *imageAsyncTask) gin.H {
 		}
 	}
 	return resp
+}
+
+func finalImageDataFromUpscaleJobs(jobs []gin.H) []gin.H {
+	if len(jobs) == 0 {
+		return nil
+	}
+	data := make([]gin.H, 0, len(jobs))
+	for _, job := range jobs {
+		if status, _ := job["status"].(string); status != "" && status != upscaleJobStatusSucceeded {
+			return nil
+		}
+		url, _ := job["result_image_url"].(string)
+		url = strings.TrimSpace(url)
+		if url == "" {
+			return nil
+		}
+		data = append(data, gin.H{"url": url})
+	}
+	return data
 }
 
 func prepareImageGenerationAsyncRequest(rawJSON []byte) (*imageAsyncPreparedRequest, *imageAsyncRequestError) {
