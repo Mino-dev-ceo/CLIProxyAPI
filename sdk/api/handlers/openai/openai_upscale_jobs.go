@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -215,13 +216,15 @@ func (s *upscaleJobStore) create(req upscaleJobCreateRequest) (*upscaleJob, erro
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.loadLocked(); err != nil {
-		return nil, err
-	}
-	s.jobs[job.ID] = job
-	s.order = append(s.order, job.ID)
-	s.cleanupLocked(time.Now())
-	if err := s.saveLocked(); err != nil {
+	if err := s.withFileLockLocked(func() error {
+		if err := s.loadLocked(); err != nil {
+			return err
+		}
+		s.jobs[job.ID] = job
+		s.order = append(s.order, job.ID)
+		s.cleanupLocked(time.Now())
+		return s.saveLocked()
+	}); err != nil {
 		return nil, err
 	}
 	return cloneUpscaleJob(job), nil
@@ -234,7 +237,9 @@ func (s *upscaleJobStore) snapshot(jobID string) (*upscaleJob, bool) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.loadLocked(); err != nil {
+	if err := s.withFileLockLocked(func() error {
+		return s.loadLocked()
+	}); err != nil {
 		return nil, false
 	}
 	job, ok := s.jobs[jobID]
@@ -249,26 +254,36 @@ func (s *upscaleJobStore) claim(workerID string) (*upscaleJob, bool, error) {
 	ts := now.UTC().Format(time.RFC3339)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.loadLocked(); err != nil {
+	var claimed *upscaleJob
+	if err := s.withFileLockLocked(func() error {
+		if err := s.loadLocked(); err != nil {
+			return err
+		}
+		s.requeueStaleLocked(now)
+		for _, id := range s.order {
+			job := s.jobs[id]
+			if job == nil || job.Status != upscaleJobStatusQueued {
+				continue
+			}
+			job.Status = upscaleJobStatusRunning
+			job.WorkerID = workerID
+			job.ClaimedAt = ts
+			job.HeartbeatAt = ts
+			job.UpdatedAt = ts
+			job.Attempts++
+			job.ErrorMessage = ""
+			if err := s.saveLocked(); err != nil {
+				return err
+			}
+			claimed = cloneUpscaleJob(job)
+			return nil
+		}
+		return nil
+	}); err != nil {
 		return nil, false, err
 	}
-	s.requeueStaleLocked(now)
-	for _, id := range s.order {
-		job := s.jobs[id]
-		if job == nil || job.Status != upscaleJobStatusQueued {
-			continue
-		}
-		job.Status = upscaleJobStatusRunning
-		job.WorkerID = workerID
-		job.ClaimedAt = ts
-		job.HeartbeatAt = ts
-		job.UpdatedAt = ts
-		job.Attempts++
-		job.ErrorMessage = ""
-		if err := s.saveLocked(); err != nil {
-			return nil, false, err
-		}
-		return cloneUpscaleJob(job), true, nil
+	if claimed != nil {
+		return claimed, true, nil
 	}
 	return nil, false, nil
 }
@@ -286,62 +301,68 @@ func (s *upscaleJobStore) workerUpdate(jobID string, workerID string, action str
 	ts := nowUpscaleISO()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.loadLocked(); err != nil {
-		return nil, err
-	}
-	job := s.jobs[jobID]
-	if job == nil {
-		return nil, errUpscaleJobNotFound
-	}
-	if job.WorkerID != "" && workerID != "" && job.WorkerID != workerID {
-		return nil, errUpscaleJobWorkerMismatch
-	}
-	switch action {
-	case "heartbeat":
-		job.HeartbeatAt = ts
-		job.UpdatedAt = ts
-	case "complete":
-		job.Status = upscaleJobStatusSucceeded
-		job.ResultImageURL = strings.TrimSpace(valueAsString(body["result_image_url"]))
-		job.SourceWidth = coalesceNullableNumber(body["source_width"], job.SourceWidth)
-		job.SourceHeight = coalesceNullableNumber(body["source_height"], job.SourceHeight)
-		job.OutputWidth = nullableNumber(body["output_width"])
-		job.OutputHeight = nullableNumber(body["output_height"])
-		job.UpscaleSec = nullableNumber(body["upscale_sec"])
-		job.Summary = cloneMapFromAny(body["summary"])
-		job.ErrorMessage = ""
-		job.HeartbeatAt = ts
-		job.FinishedAt = ts
-		job.UpdatedAt = ts
-	case "fail":
-		job.Status = upscaleJobStatusFailed
-		job.ErrorMessage = strings.TrimSpace(valueAsString(body["error_message"]))
-		if job.ErrorMessage == "" {
-			job.ErrorMessage = "worker failed"
+	var updated *upscaleJob
+	if err := s.withFileLockLocked(func() error {
+		if err := s.loadLocked(); err != nil {
+			return err
 		}
-		job.Summary = cloneMapFromAny(body["summary"])
-		job.HeartbeatAt = ts
-		job.FinishedAt = ts
-		job.UpdatedAt = ts
-	default:
-		return nil, fmt.Errorf("unsupported job action %q", action)
-	}
-	if err := s.saveLocked(); err != nil {
+		job := s.jobs[jobID]
+		if job == nil {
+			return errUpscaleJobNotFound
+		}
+		if job.WorkerID != "" && workerID != "" && job.WorkerID != workerID {
+			return errUpscaleJobWorkerMismatch
+		}
+		switch action {
+		case "heartbeat":
+			job.HeartbeatAt = ts
+			job.UpdatedAt = ts
+		case "complete":
+			job.Status = upscaleJobStatusSucceeded
+			job.ResultImageURL = strings.TrimSpace(valueAsString(body["result_image_url"]))
+			job.SourceWidth = coalesceNullableNumber(body["source_width"], job.SourceWidth)
+			job.SourceHeight = coalesceNullableNumber(body["source_height"], job.SourceHeight)
+			job.OutputWidth = nullableNumber(body["output_width"])
+			job.OutputHeight = nullableNumber(body["output_height"])
+			job.UpscaleSec = nullableNumber(body["upscale_sec"])
+			job.Summary = cloneMapFromAny(body["summary"])
+			job.ErrorMessage = ""
+			job.HeartbeatAt = ts
+			job.FinishedAt = ts
+			job.UpdatedAt = ts
+		case "fail":
+			job.Status = upscaleJobStatusFailed
+			job.ErrorMessage = strings.TrimSpace(valueAsString(body["error_message"]))
+			if job.ErrorMessage == "" {
+				job.ErrorMessage = "worker failed"
+			}
+			job.Summary = cloneMapFromAny(body["summary"])
+			job.HeartbeatAt = ts
+			job.FinishedAt = ts
+			job.UpdatedAt = ts
+		default:
+			return fmt.Errorf("unsupported job action %q", action)
+		}
+		if err := s.saveLocked(); err != nil {
+			return err
+		}
+		updated = cloneUpscaleJob(job)
+		return nil
+	}); err != nil {
 		return nil, err
 	}
-	return cloneUpscaleJob(job), nil
+	return updated, nil
 }
 
 func (s *upscaleJobStore) load() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.loadLocked()
+	return s.withFileLockLocked(func() error {
+		return s.loadLocked()
+	})
 }
 
 func (s *upscaleJobStore) loadLocked() error {
-	if s.loaded {
-		return nil
-	}
 	s.loaded = true
 	if strings.TrimSpace(s.path) == "" {
 		return nil
@@ -349,6 +370,8 @@ func (s *upscaleJobStore) loadLocked() error {
 	data, err := os.ReadFile(s.path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
+			s.jobs = make(map[string]*upscaleJob)
+			s.order = nil
 			return nil
 		}
 		return fmt.Errorf("upscale jobs: read store: %w", err)
@@ -365,10 +388,42 @@ func (s *upscaleJobStore) loadLocked() error {
 		if job == nil || strings.TrimSpace(job.ID) == "" {
 			continue
 		}
+		normalizeLoadedUpscaleJob(job)
 		s.jobs[job.ID] = job
 		s.order = append(s.order, job.ID)
 	}
 	return nil
+}
+
+func normalizeLoadedUpscaleJob(job *upscaleJob) {
+	job.SourceWidth = nullableNumber(job.SourceWidth)
+	job.SourceHeight = nullableNumber(job.SourceHeight)
+	job.OutputWidth = nullableNumber(job.OutputWidth)
+	job.OutputHeight = nullableNumber(job.OutputHeight)
+	job.GenerationSec = nullableNumber(job.GenerationSec)
+	job.UpscaleSec = nullableNumber(job.UpscaleSec)
+}
+
+func (s *upscaleJobStore) withFileLockLocked(fn func() error) error {
+	if strings.TrimSpace(s.path) == "" {
+		return fn()
+	}
+	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
+		return fmt.Errorf("upscale jobs: create store dir: %w", err)
+	}
+	lockPath := s.path + ".lock"
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("upscale jobs: open store lock: %w", err)
+	}
+	defer lockFile.Close()
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("upscale jobs: lock store: %w", err)
+	}
+	defer func() {
+		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	}()
+	return fn()
 }
 
 func (s *upscaleJobStore) saveLocked() error {
@@ -391,9 +446,23 @@ func (s *upscaleJobStore) saveLocked() error {
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
 		return fmt.Errorf("upscale jobs: create store dir: %w", err)
 	}
-	tmp := fmt.Sprintf("%s.%d.tmp", s.path, time.Now().UnixNano())
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	tmpFile, err := os.CreateTemp(filepath.Dir(s.path), filepath.Base(s.path)+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("upscale jobs: create temp store: %w", err)
+	}
+	tmp := tmpFile.Name()
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmp)
 		return fmt.Errorf("upscale jobs: write temp store: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("upscale jobs: close temp store: %w", err)
+	}
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("upscale jobs: chmod temp store: %w", err)
 	}
 	if err := os.Rename(tmp, s.path); err != nil {
 		_ = os.Remove(tmp)
@@ -617,13 +686,13 @@ func nullableNumber(v any) any {
 		if n == 0 {
 			return nil
 		}
-		return n
+		return normalizeNullableInteger(n)
 	case float64:
 		if n == 0 {
 			return nil
 		}
 		if n == float64(int64(n)) {
-			return int64(n)
+			return normalizeNullableInteger(int64(n))
 		}
 		return n
 	case json.Number:
@@ -631,7 +700,7 @@ func nullableNumber(v any) any {
 			if i == 0 {
 				return nil
 			}
-			return i
+			return normalizeNullableInteger(i)
 		}
 		if f, err := n.Float64(); err == nil {
 			if f == 0 {
@@ -649,7 +718,7 @@ func nullableNumber(v any) any {
 			if i == 0 {
 				return nil
 			}
-			return i
+			return normalizeNullableInteger(i)
 		}
 		if f, err := strconv.ParseFloat(text, 64); err == nil {
 			if f == 0 {
@@ -659,6 +728,14 @@ func nullableNumber(v any) any {
 		}
 		return nil
 	}
+}
+
+func normalizeNullableInteger(n int64) any {
+	asInt := int(n)
+	if int64(asInt) == n {
+		return asInt
+	}
+	return n
 }
 
 func coalesceNullableNumber(v any, fallback any) any {
