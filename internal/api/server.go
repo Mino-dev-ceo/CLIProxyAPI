@@ -405,6 +405,21 @@ func (s *Server) setupRoutes() {
 		v1.POST("/responses/compact", openaiResponsesHandlers.Compact)
 	}
 
+	upscale := s.engine.Group("/api/upscale")
+	upscale.Use(AuthMiddleware(s.accessManager))
+	{
+		upscale.POST("/jobs", openaiHandlers.CreateUpscaleJob)
+		upscale.GET("/jobs/:job_id", openaiHandlers.GetUpscaleJob)
+	}
+
+	worker := s.engine.Group("/api/worker")
+	{
+		worker.POST("/jobs/claim", openaiHandlers.ClaimUpscaleJob)
+		worker.POST("/jobs/:job_id/heartbeat", openaiHandlers.HeartbeatUpscaleJob)
+		worker.POST("/jobs/:job_id/complete", openaiHandlers.CompleteUpscaleJob)
+		worker.POST("/jobs/:job_id/fail", openaiHandlers.FailUpscaleJob)
+	}
+
 	// Codex CLI direct route aliases (chatgpt_base_url compatible)
 	codexDirect := s.engine.Group("/backend-api/codex")
 	codexDirect.Use(AuthMiddleware(s.accessManager))

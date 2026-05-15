@@ -378,6 +378,10 @@ func (h *OpenAIAPIHandler) ImagesGenerations(c *gin.Context) {
 		})
 		return
 	}
+	if upscale, _, _ := parseImageAsyncUpscaleJSON(rawJSON); upscale {
+		h.enqueueImageGenerationUpscaleTask(c, rawJSON)
+		return
+	}
 
 	imageModel := strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String())
 	if imageModel == "" {

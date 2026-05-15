@@ -41,6 +41,10 @@ var errImageAsyncQueueFull = errors.New("image task queue is full")
 type imageAsyncPreparedRequest struct {
 	responsesReq   []byte
 	responseFormat string
+	prompt         string
+	upscale        bool
+	targetLongEdge int
+	metadata       map[string]any
 }
 
 type imageAsyncRequestError struct {
@@ -50,19 +54,23 @@ type imageAsyncRequestError struct {
 }
 
 type imageAsyncTask struct {
-	ID             string
-	Status         string
-	Progress       string
-	CreatedAt      int64
-	StartedAt      int64
-	CompletedAt    int64
-	UpdatedAt      int64
-	ResponsesReq   []byte
-	ResponseFormat string
-	Response       []byte
-	ErrorMessage   string
-	ErrorStatus    int
-	Handler        *OpenAIAPIHandler
+	ID              string
+	Status          string
+	Progress        string
+	CreatedAt       int64
+	StartedAt       int64
+	CompletedAt     int64
+	UpdatedAt       int64
+	ResponsesReq    []byte
+	ResponseFormat  string
+	Response        []byte
+	ErrorMessage    string
+	ErrorStatus     int
+	Handler         *OpenAIAPIHandler
+	Upscale         bool
+	TargetLongEdge  int
+	UpscaleMetadata map[string]any
+	UpscaleJobIDs   []string
 }
 
 type imageAsyncTaskStore struct {
@@ -103,6 +111,33 @@ func (h *OpenAIAPIHandler) ImagesGenerationsAsync(c *gin.Context) {
 		return
 	}
 
+	task, err := getImageAsyncTaskStore().enqueue(h, prepared)
+	if err != nil {
+		c.Header("Retry-After", "1")
+		writeImageAsyncRequestError(c, &imageAsyncRequestError{
+			status:  http.StatusServiceUnavailable,
+			message: err.Error(),
+			typ:     "server_error",
+		})
+		return
+	}
+	c.JSON(http.StatusAccepted, imageAsyncTaskResponse(task))
+}
+
+func (h *OpenAIAPIHandler) enqueueImageGenerationUpscaleTask(c *gin.Context, rawJSON []byte) {
+	if !imageAsyncTasksEnabled() {
+		writeImageAsyncRequestError(c, &imageAsyncRequestError{
+			status:  http.StatusServiceUnavailable,
+			message: "image async tasks are not enabled",
+			typ:     "service_unavailable",
+		})
+		return
+	}
+	prepared, reqErr := prepareImageGenerationAsyncRequest(rawJSON)
+	if reqErr != nil {
+		writeImageAsyncRequestError(c, reqErr)
+		return
+	}
 	task, err := getImageAsyncTaskStore().enqueue(h, prepared)
 	if err != nil {
 		c.Header("Retry-After", "1")
@@ -190,14 +225,17 @@ func (s *imageAsyncTaskStore) enqueue(h *OpenAIAPIHandler, prepared *imageAsyncP
 	taskID := "task_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	now := time.Now().Unix()
 	task := &imageAsyncTask{
-		ID:             taskID,
-		Status:         imageTaskStatusQueued,
-		Progress:       "0%",
-		CreatedAt:      now,
-		UpdatedAt:      now,
-		ResponsesReq:   append([]byte(nil), prepared.responsesReq...),
-		ResponseFormat: prepared.responseFormat,
-		Handler:        h,
+		ID:              taskID,
+		Status:          imageTaskStatusQueued,
+		Progress:        "0%",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+		ResponsesReq:    append([]byte(nil), prepared.responsesReq...),
+		ResponseFormat:  prepared.responseFormat,
+		Handler:         h,
+		Upscale:         prepared.upscale,
+		TargetLongEdge:  prepared.targetLongEdge,
+		UpscaleMetadata: cloneMap(prepared.metadata),
 	}
 
 	s.mu.Lock()
@@ -261,6 +299,23 @@ func (s *imageAsyncTaskStore) run(taskID string) {
 	}
 
 	finishedAt := time.Now().Unix()
+	var upscaleJobIDs []string
+	if task.Upscale {
+		generationSec := float64(finishedAt - task.StartedAt)
+		jobs, err := createUpscaleJobsFromImageResponse(out, task.ID, task.ResponsesReq, task.TargetLongEdge, task.UpscaleMetadata, generationSec)
+		if err != nil {
+			s.update(taskID, func(t *imageAsyncTask) {
+				t.Status = imageTaskStatusFailed
+				t.Progress = "100%"
+				t.CompletedAt = finishedAt
+				t.UpdatedAt = finishedAt
+				t.ErrorStatus = http.StatusInternalServerError
+				t.ErrorMessage = err.Error()
+			})
+			return
+		}
+		upscaleJobIDs = jobs
+	}
 	s.update(taskID, func(t *imageAsyncTask) {
 		t.Status = imageTaskStatusSucceeded
 		t.Progress = "100%"
@@ -269,6 +324,7 @@ func (s *imageAsyncTaskStore) run(taskID string) {
 		t.Response = append(t.Response[:0], out...)
 		t.ErrorStatus = 0
 		t.ErrorMessage = ""
+		t.UpscaleJobIDs = append(t.UpscaleJobIDs[:0], upscaleJobIDs...)
 	})
 }
 
@@ -291,6 +347,8 @@ func (s *imageAsyncTaskStore) snapshot(taskID string) (*imageAsyncTask, bool) {
 	clone := *task
 	clone.ResponsesReq = append([]byte(nil), task.ResponsesReq...)
 	clone.Response = append([]byte(nil), task.Response...)
+	clone.UpscaleMetadata = cloneMap(task.UpscaleMetadata)
+	clone.UpscaleJobIDs = append([]string(nil), task.UpscaleJobIDs...)
 	return &clone, true
 }
 
@@ -348,6 +406,27 @@ func imageAsyncTaskResponse(task *imageAsyncTask) gin.H {
 		"started_at":   task.StartedAt,
 		"completed_at": task.CompletedAt,
 	}
+	if task.Upscale {
+		resp["upscale"] = true
+	}
+	if len(task.UpscaleJobIDs) > 0 {
+		jobs := make([]gin.H, 0, len(task.UpscaleJobIDs))
+		for _, jobID := range task.UpscaleJobIDs {
+			if job, ok := getUpscaleJobStore().snapshot(jobID); ok {
+				jobs = append(jobs, publicUpscaleJob(job))
+			} else {
+				jobs = append(jobs, gin.H{"id": jobID, "status": "unknown"})
+			}
+		}
+		resp["upscale_jobs"] = jobs
+		if len(jobs) == 1 {
+			resp["upscale_job"] = jobs[0]
+			if url, _ := jobs[0]["result_image_url"].(string); strings.TrimSpace(url) != "" {
+				resp["result_image_url"] = url
+				resp["final_url"] = url
+			}
+		}
+	}
 	if task.Status == imageTaskStatusFailed {
 		status := task.ErrorStatus
 		if status <= 0 {
@@ -403,6 +482,17 @@ func prepareImageGenerationAsyncRequest(rawJSON []byte) (*imageAsyncPreparedRequ
 	}
 
 	responseFormat := strings.TrimSpace(gjson.GetBytes(rawJSON, "response_format").String())
+	upscale, targetLongEdge, metadata := parseImageAsyncUpscaleJSON(rawJSON)
+	if upscale {
+		if !imageObjectStorageConfigured() {
+			return nil, &imageAsyncRequestError{
+				status:  http.StatusServiceUnavailable,
+				message: "image object storage is required for upscale jobs",
+				typ:     "service_unavailable",
+			}
+		}
+		responseFormat = "url"
+	}
 
 	tool := []byte(`{"type":"image_generation","action":"generate"}`)
 	tool, _ = sjson.SetBytes(tool, "model", imageModel)
@@ -421,6 +511,10 @@ func prepareImageGenerationAsyncRequest(rawJSON []byte) (*imageAsyncPreparedRequ
 	return &imageAsyncPreparedRequest{
 		responsesReq:   buildImagesResponsesRequest(prompt, nil, tool),
 		responseFormat: responseFormat,
+		prompt:         prompt,
+		upscale:        upscale,
+		targetLongEdge: targetLongEdge,
+		metadata:       metadata,
 	}, nil
 }
 
@@ -483,6 +577,17 @@ func prepareImageEditAsyncJSONRequest(rawJSON []byte) (*imageAsyncPreparedReques
 	}
 
 	responseFormat := strings.TrimSpace(gjson.GetBytes(rawJSON, "response_format").String())
+	upscale, targetLongEdge, metadata := parseImageAsyncUpscaleJSON(rawJSON)
+	if upscale {
+		if !imageObjectStorageConfigured() {
+			return nil, &imageAsyncRequestError{
+				status:  http.StatusServiceUnavailable,
+				message: "image object storage is required for upscale jobs",
+				typ:     "service_unavailable",
+			}
+		}
+		responseFormat = "url"
+	}
 
 	tool := []byte(`{"type":"image_generation","action":"edit"}`)
 	tool, _ = sjson.SetBytes(tool, "model", imageModel)
@@ -504,6 +609,10 @@ func prepareImageEditAsyncJSONRequest(rawJSON []byte) (*imageAsyncPreparedReques
 	return &imageAsyncPreparedRequest{
 		responsesReq:   buildImagesResponsesRequest(prompt, images, tool),
 		responseFormat: responseFormat,
+		prompt:         prompt,
+		upscale:        upscale,
+		targetLongEdge: targetLongEdge,
+		metadata:       metadata,
 	}, nil
 }
 
@@ -561,6 +670,17 @@ func prepareImageEditAsyncMultipartRequest(c *gin.Context) (*imageAsyncPreparedR
 	}
 
 	responseFormat := strings.TrimSpace(c.PostForm("response_format"))
+	upscale, targetLongEdge := parseImageAsyncUpscaleForm(c)
+	if upscale {
+		if !imageObjectStorageConfigured() {
+			return nil, &imageAsyncRequestError{
+				status:  http.StatusServiceUnavailable,
+				message: "image object storage is required for upscale jobs",
+				typ:     "service_unavailable",
+			}
+		}
+		responseFormat = "url"
+	}
 
 	tool := []byte(`{"type":"image_generation","action":"edit"}`)
 	tool, _ = sjson.SetBytes(tool, "model", imageModel)
@@ -582,7 +702,122 @@ func prepareImageEditAsyncMultipartRequest(c *gin.Context) (*imageAsyncPreparedR
 	return &imageAsyncPreparedRequest{
 		responsesReq:   buildImagesResponsesRequest(prompt, imageFiles, tool),
 		responseFormat: responseFormat,
+		prompt:         prompt,
+		upscale:        upscale,
+		targetLongEdge: targetLongEdge,
+		metadata:       nil,
 	}, nil
+}
+
+func createUpscaleJobsFromImageResponse(response []byte, imageTaskID string, responsesReq []byte, targetLongEdge int, metadata map[string]any, generationSec float64) ([]string, error) {
+	if targetLongEdge <= 0 {
+		targetLongEdge = defaultUpscaleTargetLongEdge
+	}
+	root := gjson.ParseBytes(response)
+	data := root.Get("data")
+	if !data.IsArray() || len(data.Array()) == 0 {
+		return nil, errors.New("image response has no data items for upscale")
+	}
+	sourceWidth, sourceHeight := parseImageSize(root.Get("size").String())
+	if sourceWidth == nil || sourceHeight == nil {
+		sourceWidth, sourceHeight = parseImageSize(gjson.GetBytes(responsesReq, "tools.0.size").String())
+	}
+	prompt := strings.TrimSpace(gjson.GetBytes(responsesReq, "input.0.content.0.text").String())
+	jobIDs := make([]string, 0, len(data.Array()))
+	for index, item := range data.Array() {
+		sourceURL := strings.TrimSpace(item.Get("url").String())
+		if sourceURL == "" {
+			return nil, errors.New("image response item has no source URL for upscale")
+		}
+		if strings.HasPrefix(sourceURL, "data:") {
+			return nil, errors.New("upscale source URL is a data URL; configure image R2 object storage")
+		}
+		jobMetadata := cloneMap(metadata)
+		if jobMetadata == nil {
+			jobMetadata = make(map[string]any)
+		}
+		jobMetadata["image_task_id"] = imageTaskID
+		jobMetadata["image_index"] = index
+		if objectKey := strings.TrimSpace(item.Get("object_key").String()); objectKey != "" {
+			jobMetadata["source_object_key"] = objectKey
+		}
+		job, err := getUpscaleJobStore().create(upscaleJobCreateRequest{
+			SourceImageURL: sourceURL,
+			SourceWidth:    sourceWidth,
+			SourceHeight:   sourceHeight,
+			TargetLongEdge: targetLongEdge,
+			Prompt:         prompt,
+			Metadata:       jobMetadata,
+			GenerationSec:  generationSec,
+		})
+		if err != nil {
+			return nil, err
+		}
+		jobIDs = append(jobIDs, job.ID)
+	}
+	return jobIDs, nil
+}
+
+func parseImageSize(size string) (any, any) {
+	parts := strings.Split(strings.ToLower(strings.TrimSpace(size)), "x")
+	if len(parts) != 2 {
+		return nil, nil
+	}
+	w, errW := strconv.Atoi(strings.TrimSpace(parts[0]))
+	h, errH := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if errW != nil || errH != nil || w <= 0 || h <= 0 {
+		return nil, nil
+	}
+	return w, h
+}
+
+func parseImageAsyncUpscaleJSON(rawJSON []byte) (bool, int, map[string]any) {
+	root := gjson.ParseBytes(rawJSON)
+	enabled := false
+	if v := root.Get("upscale"); v.Exists() {
+		switch {
+		case v.IsObject():
+			enabled = parseBoolField(v.Get("enabled").String(), true)
+		case v.Type == gjson.True:
+			enabled = true
+		case v.Type == gjson.String:
+			enabled = parseBoolField(v.String(), false)
+		}
+	}
+	for _, field := range []string{"upscale_4k", "enable_upscale"} {
+		if v := root.Get(field); v.Exists() {
+			enabled = v.Bool()
+		}
+	}
+	target := defaultUpscaleTargetLongEdge
+	for _, field := range []string{"upscale.target_long_edge", "upscale.long_edge", "target_long_edge", "upscale_target_long_edge"} {
+		if v := root.Get(field); v.Exists() && v.Type == gjson.Number && v.Int() > 0 {
+			target = int(v.Int())
+			break
+		}
+	}
+	var metadata map[string]any
+	if raw := root.Get("upscale.metadata"); raw.Exists() && raw.IsObject() {
+		_ = json.Unmarshal([]byte(raw.Raw), &metadata)
+	}
+	return enabled, target, metadata
+}
+
+func parseImageAsyncUpscaleForm(c *gin.Context) (bool, int) {
+	enabled := parseBoolField(c.PostForm("upscale"), false)
+	if c.PostForm("upscale_4k") != "" {
+		enabled = parseBoolField(c.PostForm("upscale_4k"), enabled)
+	}
+	target := defaultUpscaleTargetLongEdge
+	for _, field := range []string{"target_long_edge", "upscale_target_long_edge"} {
+		if raw := strings.TrimSpace(c.PostForm(field)); raw != "" {
+			if v, err := strconv.Atoi(raw); err == nil && v > 0 {
+				target = v
+				break
+			}
+		}
+	}
+	return enabled, target
 }
 
 func imagesDisabled(h *OpenAIAPIHandler) bool {
