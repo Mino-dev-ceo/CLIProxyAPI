@@ -3,6 +3,7 @@ package executor
 import (
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/tidwall/gjson"
 )
@@ -114,5 +115,19 @@ func TestEnsureImageGenerationTool_FreeCodexAuthDoesNotInjectTool(t *testing.T) 
 	}
 	if gjson.GetBytes(result, "tools").Exists() {
 		t.Fatalf("expected no tools for free codex auth, got %s", gjson.GetBytes(result, "tools").Raw)
+	}
+}
+
+func TestPatchedCodexCompletedOutputAllowsImageUsageFallback(t *testing.T) {
+	completed := []byte(`{"type":"response.completed","response":{"output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)
+	item := []byte(`{"type":"image_generation_call","result":"AA==","output_format":"png"}`)
+	patched := patchCodexCompletedOutput(completed, map[int64][]byte{0: item}, nil)
+
+	detail, ok := helps.ParseCodexImageToolUsage(patched)
+	if !ok {
+		t.Fatalf("expected patched image output to produce image usage fallback, got false; payload=%s", string(patched))
+	}
+	if detail.OutputTokens != 1 || detail.TotalTokens != 1 {
+		t.Fatalf("detail = %+v, want one image unit", detail)
 	}
 }
