@@ -56,6 +56,39 @@ func TestParseOpenAIUsageIgnoresNullUsage(t *testing.T) {
 	}
 }
 
+func TestParseCodexImageToolUsageUsesTokenFieldsWhenPresent(t *testing.T) {
+	data := []byte(`{"response":{"tool_usage":{"image_gen":{"input_tokens":3,"output_tokens":5,"total_tokens":8}},"output":[{"type":"image_generation_call","result":"AA=="}]}}`)
+	detail, ok := ParseCodexImageToolUsage(data)
+	if !ok {
+		t.Fatal("ParseCodexImageToolUsage() ok = false, want true")
+	}
+	if detail.InputTokens != 3 || detail.OutputTokens != 5 || detail.TotalTokens != 8 {
+		t.Fatalf("detail = %+v, want token usage 3/5/8", detail)
+	}
+}
+
+func TestParseCodexImageToolUsageFallsBackToImageUnitCount(t *testing.T) {
+	data := []byte(`{"response":{"tool_usage":{"image_gen":{"image_count":2}}}}`)
+	detail, ok := ParseCodexImageToolUsage(data)
+	if !ok {
+		t.Fatal("ParseCodexImageToolUsage() ok = false, want true")
+	}
+	if detail.OutputTokens != 2 || detail.TotalTokens != 2 {
+		t.Fatalf("detail = %+v, want two image units", detail)
+	}
+}
+
+func TestParseCodexImageToolUsageCountsCompletedImageOutputs(t *testing.T) {
+	data := []byte(`{"response":{"output":[{"type":"image_generation_call","result":"AA=="},{"type":"image_generation_call","result":"BB=="},{"type":"image_generation_call","result":""},{"type":"message","content":[]}]}}`)
+	detail, ok := ParseCodexImageToolUsage(data)
+	if !ok {
+		t.Fatal("ParseCodexImageToolUsage() ok = false, want true")
+	}
+	if detail.OutputTokens != 2 || detail.TotalTokens != 2 {
+		t.Fatalf("detail = %+v, want two generated image units", detail)
+	}
+}
+
 func TestParseOpenAIStreamUsageIgnoresNullUsage(t *testing.T) {
 	line := []byte(`data: {"id":"chunk_1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}],"usage":null}`)
 	if detail, ok := ParseOpenAIStreamUsage(line); ok {

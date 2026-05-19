@@ -280,11 +280,18 @@ func ParseCodexUsage(data []byte) (usage.Detail, bool) {
 }
 
 func ParseCodexImageToolUsage(data []byte) (usage.Detail, bool) {
-	usageNode := gjson.ParseBytes(data).Get("response.tool_usage.image_gen")
-	if !hasOpenAIStyleUsageTokenFields(usageNode) {
-		return usage.Detail{}, false
+	root := gjson.ParseBytes(data)
+	usageNode := root.Get("response.tool_usage.image_gen")
+	if hasOpenAIStyleUsageTokenFields(usageNode) {
+		return parseOpenAIStyleUsageNode(usageNode), true
 	}
-	return parseOpenAIStyleUsageNode(usageNode), true
+	if detail, ok := parseCodexImageUsageUnits(usageNode); ok {
+		return detail, true
+	}
+	if count := countCodexGeneratedImages(root); count > 0 {
+		return usage.Detail{OutputTokens: count, TotalTokens: count}, true
+	}
+	return usage.Detail{}, false
 }
 
 func ParseOpenAIUsage(data []byte) usage.Detail {
@@ -339,6 +346,46 @@ func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
 		detail.ReasoningTokens = reasoning.Int()
 	}
 	return detail
+}
+
+func parseCodexImageUsageUnits(usageNode gjson.Result) (usage.Detail, bool) {
+	if !usageNode.Exists() || !usageNode.IsObject() {
+		return usage.Detail{}, false
+	}
+	for _, path := range []string{
+		"images",
+		"image_count",
+		"imageCount",
+		"output_images",
+		"outputImages",
+		"generated_images",
+		"generatedImages",
+		"count",
+	} {
+		if value := usageNode.Get(path); value.Exists() && value.Int() > 0 {
+			count := value.Int()
+			return usage.Detail{OutputTokens: count, TotalTokens: count}, true
+		}
+	}
+	return usage.Detail{}, false
+}
+
+func countCodexGeneratedImages(root gjson.Result) int64 {
+	output := root.Get("response.output")
+	if !output.IsArray() {
+		return 0
+	}
+	var count int64
+	for _, item := range output.Array() {
+		if item.Get("type").String() != "image_generation_call" {
+			continue
+		}
+		if strings.TrimSpace(item.Get("result").String()) == "" {
+			continue
+		}
+		count++
+	}
+	return count
 }
 
 func ParseOpenAIStreamUsage(line []byte) (usage.Detail, bool) {
